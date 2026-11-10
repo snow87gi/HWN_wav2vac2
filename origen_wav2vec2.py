@@ -18,14 +18,10 @@ import math
 import json
 import matplotlib.pyplot as plt  #攻撃損失の推移を描画
 import sys
-#from transformers import Wav2Vec2Model
-
-#各クラウド音声認識を使う関数を読み込み
-from cloud_decode.aliyun_function import *
-from cloud_decode.tencentyun_function import *
-from cloud_decode.google_api import *
-from cloud_decode.azure_api import *
-from cloud_decode.openai_function import openai_recong
+from transformers import pipeline
+from transformers import Wav2Vec2Model
+from transformers import Wav2Vec2ForCTC
+from transformers import Wav2Vec2Processor
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'  #GPU0のみ利用
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  #GPUがなければCPU
@@ -37,10 +33,9 @@ torch.backends.cudnn.enabled = False  #cuDNNを無効化、高速化ライブラ
 
 #引数定義
 parser.add_argument('--seed', type=int, default=2025, metavar='S',help='random seed (default: 2023)')  #乱数シード2025に固定
-parser.add_argument('--epoch', type=int, default=1500)  #最適化回数。敵対的摂動を1500回
+parser.add_argument('--epoch', type=int, default=500)  #最適化回数。敵対的摂動を1500回　　#★★★現在500に変更★★★
 parser.add_argument('--speech-file-path', default='',type=str, help='speech file path')  #元音声wav
 parser.add_argument('--music-file-path', default='',type=str, help='music file path')  #背景音楽
-parser.add_argument('--attack-target', default='aliyun',type=str,choices=['tencentyun','aliyun','baiduyun','iflytec','google','azure','openai'])  #攻撃対象のASR選択肢から指定
 parser.add_argument('--sample-num', default=0,type=int, help='samples num')  #評価するサンプル番号、データセット管理用
 parser.add_argument('--sound-db', default=75,type=int, help='sound db')  #音圧レベル、絶対音の大きさを制御
 parser.add_argument('--start-second', type=float, default=0.5, help='start second in music to add perturbation')  #背景音楽のどこから攻撃音を埋め込むか
@@ -57,17 +52,23 @@ class Attacker:
         self.frame_num=240  #使うフレーム数
         self.seq_len=self.hop_length*(self.frame_num-1)+self.n_fft  #音声長の計算 計算すると 61696samples 最大3.856秒になる
 
-        #攻撃対象ASRの決定
-        if args.attack_target == 'tencentyun':
-            self.decode_function=tencent_recong
-        if args.attack_target == 'aliyun':
-            self.decode_function=aliyun_recong
-        if args.attack_target == 'google':
-            self.decode_function=google_decode
-        if args.attack_target == 'azure':
-            self.decode_function=azure_decode
-        if args.attack_target == 'openai':
-            self.decode_function=openai_recong
+        #ここにプロセッサーを追加
+        self.processor = Wav2Vec2Processor.from_pretrained(
+            "facebook/wav2vec2-base-960h"  #これ英語
+        )
+
+        #ここにwav2vec2を追加
+        self.wav2vec2 = Wav2Vec2ForCTC.from_pretrained(
+            "facebook/wav2vec2-base-960h"  #ここも英語
+        ).to(device)
+
+        self.wav2vec2.eval()
+
+        #実際に認識するか確かめる★追加
+        self.asr = pipeline(
+            "automatic-speech-recognition",
+            model="facebook/wav2vec2-base-960h",
+        )
 
         # 正規化関数
         self.normalize=normalize_e
@@ -77,12 +78,11 @@ class Attacker:
         self.speech,_=self.read_wav_file(args.speech_file_path)  #音声の読み込み
         speech_name=args.speech_file_path.split('/')[-1].split('.')[0]  #音声のファイル名を区切って単語にする(speech_name)
         self.command=speech_name.replace('_',' ')  #保存先生成
-        physical_samples_path=Path.home()/('physical_samples')/speech_name/args.attack_target  #ここのファイルに保存する
+        physical_samples_path=Path.home()/('physical_samples')/speech_name  #ここのファイルに保存する
         if not os.path.exists(physical_samples_path):
             os.makedirs(physical_samples_path)  #存在しなければファイルを作成する
         self.physical_samples_path=physical_samples_path
 
-        self.decode_count=0  #音声認識APIを何回読んだか数えるため（ブラックボックス攻撃では推論回数＝コストなので重要）
         music_file_list=glob.glob(args.music_file_path+'/*.wav')  #wavのファイルを所得
         print(f"Found {len(music_file_list)} music files to attack.")  #件数表示
 
@@ -117,8 +117,22 @@ class Attacker:
         return np.power(10, (expected_db + 20 * np.log10(max_amp_value) - 96.) / 20) / amp  #平均振幅を目標のdBに近づける倍率を計算する ＊倍率を返す＊ ampが小さいほど大きな倍率になる
         # expected→目標の音量、20 * np.log10(max_amp_value)→最大振幅を㏈変換、96→㏈FS補正。最大振幅の基準に合わせるために96㏈引く　目標dB（75dB）にするために何倍すればいいのか
     
+    #ここまでは変えなくていい
+
     # 命令音声と元音声から最適化と候補音声生成を行う
     def distribution_attack(self,speech,music): 
+        target_text = self.command.upper()  #ターゲットテキストのラベル化(★追加)
+
+        self.target_ids = self.processor.tokenizer(  #ターゲットテキストのラベル化 ex)[20,21,18...]（★追加）
+            target_text
+        ).input_ids
+
+        #★デバッグ用★
+        print(target_text)
+        print(self.target_ids)
+        #★デバッグ用★
+
+
         music_mag,music_stft_phase=wav_preprocess(music,self.n_fft,self.hop_length)  #元の音楽をSTFT変換 振幅と位相スペクトグラムに分ける（wav_preprocessで振幅と位相スペクトグラムを返す）
         music_mag=self.normalize(music_mag)  #振幅にlogを正規化、最適化を安定させる（周波数×時間）
         clean_music=conc_tog_specphase(music_mag.unsqueeze(0),music_stft_phase.unsqueeze(0),n_fft=self.n_fft,hop_length=self.hop_length).squeeze()  #正規化済みの振幅をもとに戻して元の位相と合成して音楽を再構成
@@ -192,41 +206,46 @@ class Attacker:
                     # Target = command + corresponding part of original music
                     target_audio = speech_tensor  #加工後の音楽を近づけたい目標音声を、命令音声そのものに設定
 
-                    # Log-Mel特徴量と損失を計算する
-                    target_feat = compute_log_mel_spectrogram(target_audio, n_fft=self.n_fft,   #命令音声を80次元のLog-Melスペクトグラムへ変換。これが近づけたい特徴量
-                                                                    hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=True)
-                    advised_feat = compute_log_mel_spectrogram(advised_audio, n_fft=self.n_fft,   #加工後の音楽についても同様
-                                                                hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=True)
-                    advised_mel=compute_log_mel_spectrogram(advised_audio, n_fft=self.n_fft,  #加工後の音楽の対数化前のMelスペクトグラムを計算
-                                                                hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=False)
-                    original_music_log_mel = compute_log_mel_spectrogram(original_music, n_fft=self.n_fft,  #加工前音楽のLog‐Mel特徴量
-                                                                            hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=True)
-                    original_music_mel=compute_log_mel_spectrogram(original_music, n_fft=self.n_fft,  #加工前音楽のMelスペクトグラム
-                                                                hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=False)
+                    #ここから★
+                    #Wav2Vec2の特徴量に変換
+                    outputs = self.wav2vec2(advised_audio.unsqueeze(0))  #先頭に次元を追加
+                    logits = outputs.logits  #出力は(音声の数、時間フレーム数、文字の種類数)
+                    log_probs = F.log_softmax(logits,dim=-1).transpose(0,1)  #ここで確率を計算 softmaxはスコアを確率に変換する関数
+                    input_lengths = torch.full((1,),log_probs.size(0),dtype=torch.long).to(device)
+                    labels = torch.tensor(self.target_ids,dtype=torch.long).to(device)
+                    target_lengths = torch.tensor([len(self.target_ids)],dtype=torch.long).to(device)
+                    ctc_loss = F.ctc_loss(
+                        log_probs,
+                        labels,
+                        input_lengths,
+                        target_lengths,
+                        blank=self.processor.tokenizer.pad_token_id
+                    )
+                    #print(self.processor.tokenizer.pad_token_id)  #確認するために追加★
+
+
+                    #with torch.no_grad():
+                    #    target_feat = self.wav2vec2(speech_tensor.unsqueeze(0)).last_hidden_state
+                    #advised_feat = self.wav2vec2(advised_audio.unsqueeze(0)).last_hidden_state
+
                     # NaNや無限大のとき、更新を中止
-                    if not torch.isfinite(target_feat).all() or not torch.isfinite(advised_feat).all():
-                        print("Warning: NaN or Inf detected in log-mel spectrograms, skipping this iteration")
-                        continue
+                    #if not torch.isfinite(target_feat).all() or not torch.isfinite(advised_feat).all():
+                    #    print("Warning: NaN or Inf detected in log-mel spectrograms, skipping this iteration")
+                    #    continue
                     
                     # Ensure both log-Mel spectrograms have consistent time dimensions
-                    min_time_frames = min(target_feat.shape[1], advised_feat.shape[1])  #目標と加工後で、時間フレーム数の短い方を取得
-                    target_feat = target_feat[:, :min_time_frames]
-                    advised_feat = advised_feat[:, :min_time_frames]
-                    original_music_log_mel = original_music_log_mel[:, :min_time_frames]
-                    advised_mel = advised_mel[:, :min_time_frames]
-                    original_music_mel = original_music_mel[:, :min_time_frames]  #各特徴量の時間長江尾そろえる
-                    # Calculate MAE difference for entire log-Mel spectrogram
+                    #min_time_frames = min(target_feat.shape[1], advised_feat.shape[1])  #目標と加工後で、時間フレーム数の短い方を取得
+                    #target_feat = target_feat[:, :min_time_frames]
+                    #advised_feat = advised_feat[:, :min_time_frames]
+
                     #ここの特徴量をwav2vac2に変更する
-                    wav2vec2_loss = F.l1_loss(advised_feat, target_feat)  #加工後音楽と命令音声のLog‐Mel特徴量の平均絶対誤差を求める。小さいほど両者の特量が近くなる
+                    #"wav2vec2_loss = F.mse_loss(advised_feat, target_feat)  #加工後音楽と命令音声のLog‐Mel特徴量の平均絶対誤差を求める。小さいほど両者の特量が近くなる
+
+                    #ここまで★
 
                     # Calculate advised_feat / advised_mel directly from spectrum amplitude (no need to convert to audio first)
                     seg_len = int(speech_frame.item()) if torch.is_tensor(speech_frame) else int(speech_frame)
                     # Calculate 80-dimensional log-Mel spectrogram (apply CMVN normalization) - only for noise loss calculation
-                    advised_mel=compute_log_mel_spectrogram(advised_audio, n_fft=self.n_fft,
-                                                                hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=False)
-                    
-                    original_music_mel=compute_log_mel_spectrogram(original_music, n_fft=self.n_fft,
-                                                                 hop_length=self.hop_length, n_mels=80, sr=16000, apply_cmvn_norm=False)
 
                 
                     seg_len = int(speech_frame.item()) if torch.is_tensor(speech_frame) else int(speech_frame)
@@ -265,41 +284,23 @@ class Attacker:
                     
                 
                     # 最終損失と更新
-                    if not torch.isfinite(wav2vec2_loss):
-                        print("Warning: wav2vec2_loss is not finite, using zero loss")
-                        wav2vec2_loss = torch.tensor(0.0, device=device, requires_grad=True)  #ここを変える！
+                    if not torch.isfinite(ctc_loss):
+                        print("Warning: ctc_loss is not finite")
+                        continue
+                        #wav2vec2_loss = torch.tensor(0.0, device=device, requires_grad=True)  #ここを変える！
                     
-                    # frame_snrs = []
-                    # for frame_idx in range(advised_mel.shape[1]):  # Iterate over each time frame
-                    #     # Extract signal and noise for current frame
-                    #     frame_signal = original_music_mel[:, frame_idx]  # shape: [n_mels]
-                    #     frame_noise = advised_mel[:, frame_idx] - frame_signal
-                    #     # Calculate SNR for current frame
-                    #     frame_snr = torch.sum(frame_noise ** 2) / (torch.sum(frame_signal ** 2) + 1e-8)
-                    #     if torch.isfinite(frame_snr):
-                    #         frame_snrs.append(frame_snr)
-                    # noise_loss = torch.mean(torch.stack(frame_snrs))
-                    #loss=wav2vec2_loss+40*noise_loss
-                    #loss = wav2vec2_loss+0.015*torch.norm(smooth_advised_gain,p=2)
-                    #Match music? loss=wav2vec2_loss+0.4*F.l1_loss(advised_feat,original_music_log_mel)
-                    #loss=wav2vec2_loss+0.30*torch.norm(advised_mel-original_music_mel,p=2)
-                    #loss = diff_loss_freq+F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))
-                    loss = wav2vec2_loss+200*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))  #最終損失を生成
-                    #loss = wav2vec2_loss+50*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))
-                    #noise_loss=F.mse_loss(advised_mel/ (original_music_mel + 1e-8),torch.ones_like(original_music_mel))
-                    #loss=wav2vec2_loss+0.7*noise_loss#0.8 whisper
-                    #noise_loss=F.l1_loss(advised_feat/ (original_music_log_mel + 1e-8),torch.ones_like(original_music_log_mel))
-                    #√ loss=wav2vec2_loss+0.4*noise_loss
-                    #loss=wav2vec2_loss+30*noise_loss
-                    #loss = wav2vec2_loss+400*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))+10*noise_loss
-                    #loss = wav2vec2_loss+200*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))+0.01*torch.norm(advised_mel-original_music_mel,p=2)
-                    #loss = wav2vec2_loss+600*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))+5*noise_loss
+                                        
+                    #これがもともとあったやつ
+                    #loss = wav2vec2_loss+200*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))  #最終損失を生成
+                    
+                    #ここをＣＴＣ損失に変更（★追加）
+                    loss = ctc_loss+200*F.mse_loss(smooth_advised_gain,square_smooth(smooth_advised_gain,square_kernel_size=[5],kernel_size=[5]))  #最終損失を生成 200はハイパーパラメータ大きくするとステルス性が上がる、認識は落ちる
+
                     # Ensure loss is finite
                     if not torch.isfinite(loss):
                         print("Warning: total loss is not finite, skipping backward pass")
                         continue
                         
-                    
                     optimizer.zero_grad()  #損失から逆向きに計算し、advised_gainの各要素をどちらへ変えるべきかという勾配を求める
                     loss.backward(retain_graph=True)
                     
@@ -309,9 +310,12 @@ class Attacker:
                     else:
                         print("Warning: gradients contain NaN or Inf, skipping optimizer step")
                         
-                    train_enum.set_description(f'Train attacker:(loss:{loss:.10f},wav2vec2_loss:{wav2vec2_loss:.8f})')  #進捗バーに表示
+                    train_enum.set_description(f'Train attacker:(loss:{loss:.10f},ctc_loss:{ctc_loss:.8f})')  #進捗バーに表示
                     train_enum.update()  #進捗バーを1回進める
-
+                    pred_ids = torch.argmax(outputs.logits,dim=-1)
+                    decoded_text = self.processor.batch_decode(pred_ids)[0]
+                    print(decoded_text)
+                    
                 #torch.cat((interpolate_smooth_speech_mag,speech_feature,feature_mask,advised_mag,music_mag),1).cpu().detach().numpy()
         
         # -------学習後のマスク処理---------
@@ -367,48 +371,48 @@ class Attacker:
 
         #\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 
-        #imageio.imwrite('attack_stft.png',torch.cat((interpolate_smooth_speech_mag,speech_feature,feature_mask,advised_mag,music_mag),1).cpu().detach().numpy())
         #Griffin-Limアルゴリズムによる最終音声の復元
-        wav=GLA(self.denormalize(advised_mag).unsqueeze(0),music_stft_phase.unsqueeze(0),self.n_fft,self.hop_length).squeeze()  #最終スペクトグラムをWAV波形に戻す
-            
+        #wav=GLA(self.denormalize(advised_mag).unsqueeze(0),music_stft_phase.unsqueeze(0),self.n_fft,self.hop_length).squeeze()  #最終スペクトグラムをWAV波形に戻す★★一瞬コメントアウト★★
+        wav = full_advised_audio
+
         audio_file = str(  #認証サービスに渡す一時的なWAVファイル名を生成
             self.physical_samples_path /
-            f"{self.attack_music_name}_{self.args.attack_target}_candidate.wav"
+            f"{self.attack_music_name}_candidate.wav"
         )
         wav_write(np.clip(wav.cpu().detach().numpy().ravel(),-0.9,0.9),audio_file,16000)  #復元した波形を0.9に制限し16㎑のWAVとして保存
 
-        #--------AEの出力のみ行う--------
-        print(f"AE candidate saved: {audio_file}")
-        #return True
-        #------------------------------
+        #★★デバッグ用★★
 
-        #result,success = self.decode_function(audio_file)  #選択された認証サービスの関数を呼び、文字起こしする
-        #self.decode_count+=1  #認証回数を1増やす
-        #assert success,'Decode Failed!!!'  #通信失敗時
-        #print("recognition answer:"+result)  #認証結果の文字列表示
-        #print(self.physical_samples_path)  #成功音声を保存するフォルダを表示
-        #time.sleep(20)
-        #成功条件の判定
-        #if self.command not in result.lower().replace('\'s',' is').replace(',','').replace('.','').replace('9','nine').replace('1','one'):  #命令ファイル名から作った文字列が認証結果に含まれるかを確認
-        #    return False
-        #else:  #命令文字列が含まれているとき、成功時の保存、品質評価の処理へ
-            #成功時のSNR評価と保存
+        result = self.asr(full_advised_audio.detach().cpu().numpy())
+        print("full_advised_audio全体:", result["text"])
+
+        result = self.asr(advised_audio.detach().cpu().numpy())
+        print("学習対象音声:", result["text"])  #成功
+
+        pred_ids = torch.argmax(outputs.logits,dim=-1)
+        decoded_text = self.processor.batch_decode(pred_ids)[0]
+        print(decoded_text)  #成功
+
+        #★★ここまで★★
+
+        #AEの出力を行う
+        print(f"AE candidate saved: {audio_file}")
+  
         clean_music_np = np.clip(clean_music.cpu().detach().numpy().ravel(),-0.9,0.9)  #加工前音楽をテンソルからNumPy配列へ戻し、振幅を制限
         wav_np = np.clip(wav.cpu().detach().numpy().ravel(),-0.9,0.9)  #加工後音楽も同じ形式へ変換
             
-            # SNR評価
+        # SNR評価
         noise_np = wav_np - clean_music_np  #加工前後の差分を変更量として扱う
         SNR=10*np.log10((np.sum(clean_music_np[:]**2))/(np.sum(noise_np**2)))  #元音楽のエネルギーを変更量のエネルギーで割って、dB値へ変換（値が大きいほど、変化量が元音楽に比べて小さいことを示す）
         seg_snr = self.calculate_seg_snr(clean_music_np, noise_np, sr=16000, segment_ms=50)  #50ms単位に区切った区間SNRを計算
 
-            # Add ViSQOL score and segSNR to filename
-        new_audio_filename = f"{self.attack_music_name}_{self.args.attack_target}_SNR{SNR:.3f}_segSNR{seg_snr:.3f}.wav"  #新しいファイル名を作成
+        new_audio_filename = f"{self.attack_music_name}_SNR{SNR:.3f}_segSNR{seg_snr:.3f}.wav"  #新しいファイル名を作成
         success_audio_file = str(self.physical_samples_path) + '/' + new_audio_filename
             
         wav_write(wav_np,success_audio_file,16000)    #成功した加工後の音声を保存
-            # with open(success_audio_file.replace('.wav','.json'), 'w') as json_file:
-            #     json.dump({'result':result}, json_file, ensure_ascii=False)
-            #self.decode_count=0  #認識回数を0に戻す
+
+        result = self.asr(success_audio_file)
+        print(f"最終文字起こし結果：{result["text"]}")
         return True  #処理成功
 
     #加工前音声と変更量を比較し、短時間ごとのSNRを重み付き平均で求める関数
@@ -470,157 +474,6 @@ class Attacker:
         
         return weighted_seg_snr  #計算した区間SNRを返す
 
-
-def apply_cmvn(log_mel, eps=1e-8):  #特徴量の正規化（Log-Mel特徴量を各周波数帯で平均0、分散1に揃えるためのもの）＊実際は使ってない
-    """
-    Apply CMVN (Cepstral Mean and Variance Normalization) to log-Mel spectrogram
-    Args:
-        log_mel: log-Mel spectrogram tensor, shape [n_mels, n_frames]
-        eps: Small value to prevent division by zero
-    Returns:
-        normalized_log_mel: CMVN normalized log-Mel spectrogram
-    """
-    # Calculate mean and variance for each Mel band (along time dimension)
-    mean = torch.mean(log_mel, dim=1, keepdim=True)  # shape: [n_mels, 1]/Mel帯域ごとに時間方向の平均値を計算
-    var = torch.var(log_mel, dim=1, keepdim=True, unbiased=False)  # shape: [n_mels, 1]/Mel帯域ごとに時間方向の分散を計算
-    
-    # CMVN normalization: (x - mean) / sqrt(var + eps)
-    normalized_log_mel = (log_mel - mean) / torch.sqrt(var + eps)  #各値から平均を引き、標準偏差で割る
-    
-    return normalized_log_mel #正規化済みのLog-Melを返す
-
-# MFCCを作る関数（音声認識でよく使われる特徴量※このコードでは使わない）
-def compute_mfcc_features(audio_tensor, n_fft=512, hop_length=258, n_mels=80, n_mfcc=13, sr=16000):
-    """
-    Compute MFCC features of audio
-    Args:
-        audio_tensor: Input audio tensor
-        n_fft: FFT window size
-        hop_length: Hop length
-        n_mels: Number of Mel filters
-        n_mfcc: Number of MFCC coefficients
-        sr: Sample rate
-    Returns:
-        mfcc: MFCC feature tensor, shape [n_mfcc, n_frames]
-    """
-    # Keep tensor format to maintain gradient
-    if isinstance(audio_tensor, torch.Tensor):
-        audio_for_mfcc = audio_tensor
-    else:
-        audio_for_mfcc = torch.tensor(audio_tensor, dtype=torch.float32).to(device)
-    
-    # Calculate spectrogram using torch.stft, maintaining gradients
-    stft = torch.stft(
-        audio_for_mfcc, 
-        n_fft=n_fft, 
-        hop_length=hop_length, 
-        win_length=n_fft,
-        window=torch.hann_window(n_fft).to(device),
-        center=True,
-        pad_mode='reflect',
-        normalized=False,
-        onesided=True,
-        return_complex=True
-    )
-    
-    # Calculate power spectrum
-    power_spec = torch.abs(stft) ** 2
-    
-    # Create Mel filterbank
-    mel_filters = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels, fmax=sr/2)
-    mel_filters = torch.tensor(mel_filters, dtype=torch.float32).to(device)
-    
-    # Apply Mel filter
-    mel_spec = torch.matmul(mel_filters, power_spec)
-    
-    # Ensure all values in mel_spec are positive, avoid log(0) or log(negative)
-    mel_spec = torch.clamp_min(mel_spec, 1e-10)
-    
-    # Convert to log scale
-    log_mel = torch.log(mel_spec)
-    
-    # Check and handle possible NaN or Inf values
-    log_mel = torch.where(torch.isfinite(log_mel), log_mel, torch.zeros_like(log_mel))
-    
-    # Calculate DCT (Discrete Cosine Transform) to get MFCC
-    # Create DCT matrix
-    n_frames = log_mel.shape[1]
-    dct_matrix = torch.zeros(n_mfcc, n_mels, dtype=torch.float32).to(device)
-    
-    for i in range(n_mfcc):
-        for j in range(n_mels):
-            dct_matrix[i, j] = np.cos(np.pi * i * (j + 0.5) / n_mels)
-        if i == 0:
-            dct_matrix[i, :] *= np.sqrt(1.0 / n_mels)
-        else:
-            dct_matrix[i, :] *= np.sqrt(2.0 / n_mels)
-    
-    # Apply DCT: MFCC = DCT_matrix @ log_mel
-    mfcc = torch.matmul(dct_matrix, log_mel)
-    
-    return mfcc
-# ここまでMFCCの話※使わない
-
-#学習で使う特徴量の生成（Log-Mel特徴量の作成）
-def compute_log_mel_spectrogram(audio_tensor, n_fft=512, hop_length=258, n_mels=80, sr=16000, apply_cmvn_norm=True):  #波形を80次元のMel特徴量へ変換する関数
-    """
-    Compute log-Mel spectrogram of audio
-    Args:
-        audio_tensor: Input audio tensor
-        n_fft: FFT window size
-        hop_length: Hop length
-        n_mels: Number of Mel filters
-        sr: Sample rate
-        apply_cmvn_norm: Whether to apply CMVN normalization
-    Returns:
-        log_mel: log-Mel spectrogram tensor
-    """
-    # Keep tensor format to maintain gradient
-    if isinstance(audio_tensor, torch.Tensor):  #入力がテンソルなら保持、NumPyならテンソル化して計算先へ
-        audio_for_mel = audio_tensor
-    else:
-        audio_for_mel = torch.tensor(audio_tensor, dtype=torch.float32).to(device)
-    
-    # 波形をSTFTに変換。512サンプルの窓を使い、指定した区間で分析
-    stft = torch.stft(
-        audio_for_mel, 
-        n_fft=n_fft, 
-        hop_length=hop_length, 
-        win_length=n_fft,
-        window=torch.hann_window(n_fft).to(device),
-        center=True,
-        pad_mode='reflect',
-        normalized=False,
-        onesided=True,
-        return_complex=True
-    )
-    
-    # Calculate power spectrum
-    #power_spec = torch.abs(stft) ** 2  #各周波数、時刻のパワーを計算
-    power_spec = (torch.abs(stft) ** 2).float()   # ★ ここを追加
-    
-    # Create Mel filterbank
-    mel_filters = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels, fmax=sr/2)  #80本のMelフィルタを作成し、テンソル化
-    mel_filters = torch.tensor(mel_filters, dtype=torch.float32).to(device)
-    
-    # Apply Mel filter
-    mel_spec = torch.matmul(mel_filters, power_spec) #パワースペクトルをMelスペクトグラムへ変換
-    
-    # Ensure all values in mel_spec are positive, avoid log(0) or log(negative)
-    mel_spec = torch.clamp_min(mel_spec, 1e-10)  #対数計算時の数値不安定を避けるための最小値を設定
-    if not apply_cmvn_norm:  #Falseの場合は対数化しないMelスペクトグラムを返す
-        return mel_spec
-    # Convert to log scale, using torch.clamp to ensure numerical stability
-    log_mel = torch.log(mel_spec)  #自然対数に変換
-    
-    # Check and handle possible NaN or Inf values
-    log_mel = torch.where(torch.isfinite(log_mel), log_mel, torch.zeros_like(log_mel))  #NaN、無限大は0
-    
-    # Apply CMVN normalization
-    #log_mel = apply_cmvn(log_mel)  #CMVNを適応（ここはコメントアウト）
-
-    return log_mel  #Log-Mel特徴量を返す
-
 # スペクトグラムの平滑化
 def square_smooth(input,square_kernel_size=[],kernel_size=[]):  #周波数×時間の2次元データを移動平均で滑らかにする関数
     bias=torch.zeros(1).to(device)  #畳みこみ演算に使う、値0のバイアスを作る
@@ -646,10 +499,6 @@ def edge_detection(input):
     input=F.pad(input,(padding_size,padding_size,padding_size,padding_size),mode='replicate')
     input=F.conv2d(input, kernel, bias, stride=1)
     return input.squeeze()
-
-#入力全体を平均0、標準偏差1へ変更※呼び出しなし
-def standardization(stft_distribution):
-    return (stft_distribution-stft_distribution.mean())/stft_distribution.std()
     
 # WAVファイルとして保存する
 def wav_write(wav_signal: np.ndarray, wav_path: str, sample_rate: Union[int, float], scale_bit_length: bool = True, bit_length: int = 16):  #波形データをWAVファイルとして保存する関数
